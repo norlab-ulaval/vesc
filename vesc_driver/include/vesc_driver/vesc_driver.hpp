@@ -39,6 +39,7 @@
 #include <vesc_msgs/msg/vesc_imu.hpp>
 #include <vesc_msgs/msg/vesc_imu_stamped.hpp>
 #include <experimental/optional>
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -105,6 +106,12 @@ private:
   rclcpp::SubscriptionBase::SharedPtr position_sub_;
   rclcpp::SubscriptionBase::SharedPtr servo_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr command_watchdog_timer_;
+
+  // Independent of ROS simulated time. Servo/telemetry do not refresh this timer.
+  double motor_command_timeout_sec_ = 0.25;
+  std::chrono::steady_clock::time_point last_motor_command_time_{};
+  bool motor_command_stale_ = true;
 
   // driver modes (possible states)
   typedef enum
@@ -127,6 +134,8 @@ private:
   void servoCallback(const Float64::SharedPtr servo);
   void speedCallback(const Float64::SharedPtr speed);
   void timerCallback();
+  void commandWatchdogCallback();
+  void recordMotorCommand();
 };
 
 }  // namespace vesc_driver

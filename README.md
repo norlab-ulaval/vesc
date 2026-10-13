@@ -8,6 +8,18 @@ This is a ROS2 implementation of the ROS1 driver using the new serial driver loc
 
 ## How to test
 
+The driver requires a continuous stream of motor commands. If no finite motor
+command is received for `motor_command_timeout_sec` (default 0.25 seconds), it
+sends zero RPM over serial every 50 ms. Duty-cycle, current, brake, speed and
+position commands refresh this timeout; servo commands and telemetry do not.
+The timer uses a steady clock and remains active independently of ROS simulated
+time. Motion can resume when a new motor command arrives.
+
+This protects against stopped upstream ROS nodes while the driver and serial
+link still work. A stopped driver, computer or serial connection requires the
+VESC firmware's own timeout protection; the firmware configuration has not been
+verified or changed by this software change.
+
 1. Clone this repository and [transport drivers](https://github.com/ros-drivers/transport_drivers) into `src`.
 2. `rosdep update && rosdep install --from-paths src -i -y`
 3. Plug in the VESC with a USB cable.

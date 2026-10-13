@@ -38,6 +38,7 @@
 #include <cmath>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 namespace vesc_driver
@@ -68,6 +69,10 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   // get vesc serial port address
   std::string port = declare_parameter<std::string>("port", "");
   imu_frame_ = declare_parameter<std::string>("imu_frame", "vesc");
+  motor_command_timeout_sec_ = declare_parameter<double>("motor_command_timeout_sec", 0.25);
+  if (!std::isfinite(motor_command_timeout_sec_) || motor_command_timeout_sec_ <= 0.0) {
+    throw std::invalid_argument("motor_command_timeout_sec must be finite and positive");
+  }
 
   // attempt to connect to the serial port
   try {
@@ -90,22 +95,24 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
 
   // subscribe to motor and servo command topics
   duty_cycle_sub_ = create_subscription<Float64>(
-    "commands/motor/duty_cycle", rclcpp::QoS{10}, std::bind(
+    "commands/motor/duty_cycle", rclcpp::QoS{1}, std::bind(
       &VescDriver::dutyCycleCallback, this,
       _1));
   current_sub_ = create_subscription<Float64>(
-    "commands/motor/current", rclcpp::QoS{10}, std::bind(&VescDriver::currentCallback, this, _1));
+    "commands/motor/current", rclcpp::QoS{1}, std::bind(&VescDriver::currentCallback, this, _1));
   brake_sub_ = create_subscription<Float64>(
-    "commands/motor/brake", rclcpp::QoS{10}, std::bind(&VescDriver::brakeCallback, this, _1));
+    "commands/motor/brake", rclcpp::QoS{1}, std::bind(&VescDriver::brakeCallback, this, _1));
   speed_sub_ = create_subscription<Float64>(
-    "commands/motor/speed", rclcpp::QoS{10}, std::bind(&VescDriver::speedCallback, this, _1));
+    "commands/motor/speed", rclcpp::QoS{1}, std::bind(&VescDriver::speedCallback, this, _1));
   position_sub_ = create_subscription<Float64>(
-    "commands/motor/position", rclcpp::QoS{10}, std::bind(&VescDriver::positionCallback, this, _1));
+    "commands/motor/position", rclcpp::QoS{1}, std::bind(&VescDriver::positionCallback, this, _1));
   servo_sub_ = create_subscription<Float64>(
     "commands/servo/position", rclcpp::QoS{10}, std::bind(&VescDriver::servoCallback, this, _1));
 
   // create a 200Hz timer, used for state machine & polling VESC telemetry
   timer_ = create_wall_timer(5ms, std::bind(&VescDriver::timerCallback, this));
+  command_watchdog_timer_ = create_wall_timer(
+    50ms, std::bind(&VescDriver::commandWatchdogCallback, this));
 }
 
 /* TODO or TO-THINKABOUT LIST
@@ -113,8 +120,6 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   - what to do if the vesc interface gives an error?
   - check version number against know compatable?
   - should we wait until we receive telemetry before sending commands?
-  - should we track the last motor command
-  - what to do if no motor command received recently?
   - what to do if no servo command received recently?
   - what is the motor safe off state (0 current?)
   - what to do if a command parameter is out of range, ignore?
@@ -152,6 +157,30 @@ void VescDriver::timerCallback()
   } else {
     // unknown mode, how did that happen?
     assert(false && "unknown driver mode");
+  }
+}
+
+void VescDriver::recordMotorCommand()
+{
+  last_motor_command_time_ = std::chrono::steady_clock::now();
+  motor_command_stale_ = false;
+}
+
+void VescDriver::commandWatchdogCallback()
+{
+  if (driver_mode_ != MODE_OPERATING || !vesc_.isConnected()) {
+    return;
+  }
+  const auto age = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - last_motor_command_time_).count();
+  if (age > motor_command_timeout_sec_) {
+    // Send directly over serial even if the upstream ROS watchdog/converter died.
+    // Do not count this internally generated stop as a fresh motor command.
+    vesc_.setSpeed(0.0);
+    if (!motor_command_stale_) {
+      RCLCPP_WARN(get_logger(), "Motor command timeout; commanding zero RPM");
+    }
+    motor_command_stale_ = true;
   }
 }
 
@@ -284,8 +313,9 @@ void VescDriver::vescErrorCallback(const std::string & error)
  */
 void VescDriver::dutyCycleCallback(const Float64::SharedPtr duty_cycle)
 {
-  if (driver_mode_ == MODE_OPERATING) {
+  if (driver_mode_ == MODE_OPERATING && std::isfinite(duty_cycle->data)) {
     vesc_.setDutyCycle(duty_cycle_limit_.clip(duty_cycle->data));
+    recordMotorCommand();
   }
 }
 
@@ -296,8 +326,9 @@ void VescDriver::dutyCycleCallback(const Float64::SharedPtr duty_cycle)
  */
 void VescDriver::currentCallback(const Float64::SharedPtr current)
 {
-  if (driver_mode_ == MODE_OPERATING) {
+  if (driver_mode_ == MODE_OPERATING && std::isfinite(current->data)) {
     vesc_.setCurrent(current_limit_.clip(current->data));
+    recordMotorCommand();
   }
 }
 
@@ -308,8 +339,9 @@ void VescDriver::currentCallback(const Float64::SharedPtr current)
  */
 void VescDriver::brakeCallback(const Float64::SharedPtr brake)
 {
-  if (driver_mode_ == MODE_OPERATING) {
+  if (driver_mode_ == MODE_OPERATING && std::isfinite(brake->data)) {
     vesc_.setBrake(brake_limit_.clip(brake->data));
+    recordMotorCommand();
   }
 }
 
@@ -321,8 +353,9 @@ void VescDriver::brakeCallback(const Float64::SharedPtr brake)
  */
 void VescDriver::speedCallback(const Float64::SharedPtr speed)
 {
-  if (driver_mode_ == MODE_OPERATING) {
+  if (driver_mode_ == MODE_OPERATING && std::isfinite(speed->data)) {
     vesc_.setSpeed(speed_limit_.clip(speed->data));
+    recordMotorCommand();
   }
 }
 
@@ -332,10 +365,11 @@ void VescDriver::speedCallback(const Float64::SharedPtr speed)
  */
 void VescDriver::positionCallback(const Float64::SharedPtr position)
 {
-  if (driver_mode_ == MODE_OPERATING) {
+  if (driver_mode_ == MODE_OPERATING && std::isfinite(position->data)) {
     // ROS uses radians but VESC seems to use degrees. Convert to degrees.
     double position_deg = position_limit_.clip(position->data) * 180.0 / M_PI;
     vesc_.setPosition(position_deg);
+    recordMotorCommand();
   }
 }
 

@@ -1,6 +1,7 @@
 /**:
   ros__parameters:
     port: "/dev/ttyACM0"
+    motor_command_timeout_sec: 0.25
     brake_max: 200000.0
     brake_min: -20000.0
     current_max: 100.0
